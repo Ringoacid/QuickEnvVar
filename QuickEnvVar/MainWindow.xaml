@@ -1,0 +1,290 @@
+<Window
+    x:Class="QuickEnvVar.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="clr-namespace:QuickEnvVar"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    Title="QuickEnvVar"
+    Width="900"
+    Height="650"
+    mc:Ignorable="d">
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="Margin" Value="2" />
+        </Style>
+
+        <!--  PathEntry の表示テンプレート  -->
+        <DataTemplate DataType="{x:Type local:PathEntry}">
+            <Grid HorizontalAlignment="Stretch">
+                <!--  通常表示テキスト  -->
+                <TextBlock
+                    x:Name="NormalText"
+                    Text="{Binding Path}"
+                    TextTrimming="CharacterEllipsis"
+                    ToolTip="{Binding Path}">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Style.Triggers>
+                                <!--  存在しないパス: 赤  -->
+                                <DataTrigger Binding="{Binding Exists}" Value="False">
+                                    <Setter Property="Foreground" Value="#CC2200" />
+                                </DataTrigger>
+                                <!--  重複パス: オレンジ（存在するものだけ）  -->
+                                <MultiDataTrigger>
+                                    <MultiDataTrigger.Conditions>
+                                        <Condition Binding="{Binding Exists}" Value="True" />
+                                        <Condition Binding="{Binding IsDuplicate}" Value="True" />
+                                    </MultiDataTrigger.Conditions>
+                                    <Setter Property="Foreground" Value="#CC6600" />
+                                </MultiDataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+
+                <!--  モザイク用オーバーレイ: 新規追加でないエントリに濃いモザイクをかける  -->
+                <Grid
+                    x:Name="MosaicOverlay"
+                    HorizontalAlignment="Stretch"
+                    VerticalAlignment="Stretch"
+                    Visibility="Collapsed">
+                    <!--  レイヤー1: 大きくぼかしたテキスト  -->
+                    <TextBlock
+                        Foreground="#666666"
+                        Text="{Binding Path}"
+                        TextTrimming="CharacterEllipsis">
+                        <TextBlock.Effect>
+                            <BlurEffect Radius="28" />
+                        </TextBlock.Effect>
+                    </TextBlock>
+                    <!--  レイヤー2: 半透明グレーカバー  -->
+                    <Border Background="#B0B8B8B8" CornerRadius="2" />
+                    <!--  レイヤー3: テキストの痕跡をさらにぼかす  -->
+                    <TextBlock
+                        Foreground="#44999999"
+                        Opacity="0.3"
+                        Text="{Binding Path}"
+                        TextTrimming="CharacterEllipsis">
+                        <TextBlock.Effect>
+                            <BlurEffect Radius="40" />
+                        </TextBlock.Effect>
+                    </TextBlock>
+                </Grid>
+            </Grid>
+
+            <DataTemplate.Triggers>
+                <!--  モザイクモードON かつ 新規追加でないエントリのみオーバーレイ表示  -->
+                <MultiDataTrigger>
+                    <MultiDataTrigger.Conditions>
+                        <Condition Binding="{Binding IsMosaicMode, RelativeSource={RelativeSource AncestorType=Window}}" Value="True" />
+                        <Condition Binding="{Binding IsNewlyAdded}" Value="False" />
+                    </MultiDataTrigger.Conditions>
+                    <Setter TargetName="MosaicOverlay" Property="Visibility" Value="Visible" />
+                    <Setter TargetName="NormalText" Property="Visibility" Value="Collapsed" />
+                </MultiDataTrigger>
+            </DataTemplate.Triggers>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!--  パス入力エリア  -->
+        <StackPanel Grid.Row="0" Margin="0,0,0,6">
+            <TextBlock
+                Margin="0,0,0,4"
+                FontWeight="SemiBold"
+                Text="追加するパス" />
+            <DockPanel>
+                <Button
+                    Click="OpenFolderButton_Click"
+                    Content="フォルダ選択..."
+                    DockPanel.Dock="Right" />
+                <TextBox
+                    x:Name="PathTextBox"
+                    Padding="4,2"
+                    VerticalContentAlignment="Center"
+                    TextChanged="PathTextBox_TextChanged"
+                    ToolTip="パスを直接入力するか、フォルダをドラッグ＆ドロップしてください" />
+            </DockPanel>
+            <WrapPanel Margin="0,6,0,0" Orientation="Horizontal">
+                <Button Click="AddUserPathButton_Click" Content="ユーザーPathに追加" />
+                <Button Click="AddSystemPathButton_Click" Content="システムPathに追加（管理者権限）" />
+                <Button Click="ExportButton_Click" Content="バックアップ..." />
+                <ToggleButton
+                    x:Name="MosaicToggleButton"
+                    Margin="2"
+                    Padding="6,4"
+                    Content="🔒 モザイク"
+                    IsChecked="{Binding IsMosaicMode, RelativeSource={RelativeSource AncestorType=Window}}"
+                    ToolTip="既存のPATHエントリにモザイクをかけます（新規追加分は表示されます）" />
+            </WrapPanel>
+        </StackPanel>
+
+        <!--  検索フィルタ  -->
+        <DockPanel Grid.Row="1" Margin="0,0,0,6">
+            <TextBlock
+                Margin="0,0,4,0"
+                VerticalAlignment="Center"
+                Text="検索：" />
+            <TextBox
+                x:Name="SearchTextBox"
+                Padding="4,2"
+                VerticalContentAlignment="Center"
+                TextChanged="SearchTextBox_TextChanged" />
+        </DockPanel>
+
+        <!--  リスト表示  -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!--  ユーザーPath  -->
+            <DockPanel Grid.Column="0" Margin="0,0,5,0">
+                <StackPanel Margin="0,0,0,4" DockPanel.Dock="Top">
+                    <DockPanel>
+                        <TextBlock
+                            VerticalAlignment="Center"
+                            FontWeight="Bold"
+                            Text="ユーザーPath" />
+                        <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                            <Button
+                                x:Name="UserMoveUpButton"
+                                Click="UserMoveUpButton_Click"
+                                Content="▲"
+                                ToolTip="上へ移動" />
+                            <Button
+                                x:Name="UserMoveDownButton"
+                                Click="UserMoveDownButton_Click"
+                                Content="▼"
+                                ToolTip="下へ移動" />
+                            <Button Click="RefreshPathListsButton_Click" Content="更新" />
+                        </StackPanel>
+                    </DockPanel>
+                    <!--  凡例  -->
+                    <WrapPanel Margin="0,2,0,0">
+                        <TextBlock
+                            FontSize="10"
+                            Foreground="#CC2200"
+                            Text="■" />
+                        <TextBlock
+                            Margin="0,0,6,0"
+                            FontSize="10"
+                            Text=" 存在しない　" />
+                        <TextBlock
+                            FontSize="10"
+                            Foreground="#CC6600"
+                            Text="■" />
+                        <TextBlock FontSize="10" Text=" システムPathと重複" />
+                    </WrapPanel>
+                </StackPanel>
+
+                <ListBox
+                    x:Name="UserPathListBox"
+                    HorizontalContentAlignment="Stretch"
+                    KeyDown="PathListBox_KeyDown"
+                    MouseDoubleClick="PathListBox_MouseDoubleClick"
+                    PreviewMouseRightButtonDown="PathListBox_PreviewMouseRightButtonDown">
+                    <ListBox.ContextMenu>
+                        <ContextMenu>
+                            <MenuItem Click="UserPathListBoxMenuItem_OpenFolder_Click" Header="フォルダを開く" />
+                            <MenuItem Click="UserPathListBoxMenuItem_Copy_Click" Header="パスをコピー" />
+                            <Separator />
+                            <MenuItem Click="UserPathListBoxMenuItem_Delete_Click" Header="Pathから削除" />
+                        </ContextMenu>
+                    </ListBox.ContextMenu>
+                </ListBox>
+            </DockPanel>
+
+            <!--  システムPath  -->
+            <DockPanel Grid.Column="1" Margin="5,0,0,0">
+                <StackPanel Margin="0,0,0,4" DockPanel.Dock="Top">
+                    <DockPanel>
+                        <TextBlock
+                            VerticalAlignment="Center"
+                            FontWeight="Bold"
+                            Text="システムPath" />
+                        <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                            <Button
+                                x:Name="SystemMoveUpButton"
+                                Click="SystemMoveUpButton_Click"
+                                Content="▲"
+                                IsEnabled="False"
+                                ToolTip="上へ移動（編集モード中のみ）" />
+                            <Button
+                                x:Name="SystemMoveDownButton"
+                                Click="SystemMoveDownButton_Click"
+                                Content="▼"
+                                IsEnabled="False"
+                                ToolTip="下へ移動（編集モード中のみ）" />
+                            <Button
+                                x:Name="SystemEditButton"
+                                Click="SystemEditButton_Click"
+                                Content="編集"
+                                ToolTip="編集モード開始 / 変更をまとめて適用（UAC 1回）" />
+                            <Button
+                                x:Name="SystemCancelButton"
+                                Click="SystemCancelButton_Click"
+                                Content="キャンセル"
+                                Visibility="Collapsed" />
+                        </StackPanel>
+                    </DockPanel>
+                    <!--  凡例  -->
+                    <WrapPanel Margin="0,2,0,0">
+                        <TextBlock
+                            FontSize="10"
+                            Foreground="#CC2200"
+                            Text="■" />
+                        <TextBlock
+                            Margin="0,0,6,0"
+                            FontSize="10"
+                            Text=" 存在しない　" />
+                        <TextBlock
+                            FontSize="10"
+                            Foreground="#CC6600"
+                            Text="■" />
+                        <TextBlock FontSize="10" Text=" ユーザーPathと重複" />
+                    </WrapPanel>
+                </StackPanel>
+
+                <ListBox
+                    x:Name="SystemPathListBox"
+                    HorizontalContentAlignment="Stretch"
+                    KeyDown="PathListBox_KeyDown"
+                    MouseDoubleClick="PathListBox_MouseDoubleClick"
+                    PreviewMouseRightButtonDown="PathListBox_PreviewMouseRightButtonDown">
+                    <ListBox.ContextMenu>
+                        <ContextMenu>
+                            <MenuItem Click="SystemPathListBoxMenuItem_OpenFolder_Click" Header="フォルダを開く" />
+                            <MenuItem Click="SystemPathListBoxMenuItem_Copy_Click" Header="パスをコピー" />
+                            <Separator />
+                            <MenuItem Click="SystemPathListBoxMenuItem_Delete_Click" Header="Pathから削除（管理者権限）" />
+                        </ContextMenu>
+                    </ListBox.ContextMenu>
+                </ListBox>
+            </DockPanel>
+        </Grid>
+
+        <!--  ステータスバー  -->
+        <StatusBar Grid.Row="3" Margin="0,4,0,0">
+            <StatusBarItem>
+                <TextBlock>
+                    <Run Text="ユーザー: " /><Run x:Name="UserCountRun" /><Run Text=" 件　" />
+                    <Run Text="システム: " /><Run x:Name="SystemCountRun" /><Run Text=" 件" />
+                </TextBlock>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

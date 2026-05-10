@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "QuickEnvVar": {
+      "commandName": "Project",
+      "commandLineArgs": "C:\\sample"
+    }
+  }
+}
