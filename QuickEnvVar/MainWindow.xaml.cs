@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 
@@ -41,6 +42,18 @@ public partial class MainWindow : Window
     // 編集モード（システムPath）
     private bool _systemEditMode = false;
     private List<PathEntry>? _systemEditSnapshot = null;
+
+    // 編集モード（ユーザーPath）
+    private bool _userEditMode = false;
+    private List<PathEntry>? _userEditSnapshot = null;
+
+    // Undo履歴。各要素は複数ターゲットへの書き込みをまとめた1単位
+    private readonly Stack<List<UndoOp>> _undoStack = new();
+
+    private record UndoOp(EnvironmentVariableTarget Target, string OldValue);
+
+    // Windowsレジストリの Path 値の推奨上限
+    private const int MaxPathLength = 2047;
 
     public string? PathToAdd
     {
@@ -136,6 +149,91 @@ public partial class MainWindow : Window
         return result;
     }
 
+    // --- 書き込みラッパー（長さ警告 + Undo記録） ---
+
+    private static bool ConfirmPathLength(string built, string label)
+    {
+        if (built.Length <= MaxPathLength) return true;
+        return MessageBox.Show(
+            $"{label}Pathの長さが {built.Length} 文字となり、Windowsの推奨上限（{MaxPathLength}文字）を超えています。\n" +
+            "古いPath項目が切り詰められる可能性があります。続行しますか？",
+            "警告", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes;
+    }
+
+    private bool WriteUserPathChecked(string newValue, List<UndoOp>? batch = null)
+    {
+        if (!ConfirmPathLength(newValue, "ユーザー")) return false;
+        string oldValue = ReadPathFromRegistry(RegistryHive.CurrentUser, UserPathRegistryKey);
+        WriteUserPath(newValue);
+        var op = new UndoOp(EnvironmentVariableTarget.User, oldValue);
+        if (batch is not null) batch.Add(op);
+        else PushUndo(op);
+        return true;
+    }
+
+    private bool WriteSystemPathChecked(string newValue, List<UndoOp>? batch = null)
+    {
+        if (!ConfirmPathLength(newValue, "システム")) return false;
+        string oldValue = ReadPathFromRegistry(RegistryHive.LocalMachine, SystemPathRegistryKey);
+        if (!WriteSystemPath(newValue)) return false;
+        var op = new UndoOp(EnvironmentVariableTarget.Machine, oldValue);
+        if (batch is not null) batch.Add(op);
+        else PushUndo(op);
+        return true;
+    }
+
+    private void PushUndo(UndoOp op) => PushUndo([op]);
+
+    private void PushUndo(List<UndoOp> ops)
+    {
+        if (ops.Count == 0) return;
+        _undoStack.Push(ops);
+        UpdateUndoButton();
+    }
+
+    private void UpdateUndoButton()
+    {
+        if (UndoButton != null)
+            UndoButton.IsEnabled = _undoStack.Count > 0;
+    }
+
+    private void Undo()
+    {
+        if (_undoStack.Count == 0) return;
+        if (_userEditMode || _systemEditMode)
+        {
+            MessageBox.Show("編集モード中はUndoできません。先に適用またはキャンセルしてください。",
+                "情報", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var ops = _undoStack.Pop();
+        UpdateUndoButton();
+
+        // システム側を含む場合はUACが必要。失敗時は再プッシュして整合性を保つ
+        foreach (var op in ops)
+        {
+            bool ok = op.Target == EnvironmentVariableTarget.User
+                ? TryRestoreUserPath(op.OldValue)
+                : WriteSystemPath(op.OldValue);
+            if (!ok)
+            {
+                _undoStack.Push(ops);
+                UpdateUndoButton();
+                RefreshPathLists();
+                return;
+            }
+        }
+
+        RefreshPathLists();
+    }
+
+    private static bool TryRestoreUserPath(string value)
+    {
+        try { WriteUserPath(value); return true; }
+        catch { return false; }
+    }
+
     // --- リスト更新 ---
 
     private void RefreshPathLists()
@@ -159,7 +257,8 @@ public partial class MainWindow : Window
         }
 
         UpdateDuplicates();
-        ExitSystemEditMode(apply: false);
+        ExitSystemEditMode();
+        ExitUserEditMode();
     }
 
     private void UpdateDuplicates()
@@ -243,10 +342,19 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (_userEditMode)
+        {
+            _userEntries.Add(new PathEntry(PathToAdd!) { IsNewlyAdded = true });
+            UpdateDuplicates();
+            return;
+        }
+
         string updated = BuildPathString(_userEntries) + ";" + PathToAdd;
-        WriteUserPath(updated);
-        RefreshPathLists();
-        MessageBox.Show("ユーザーPathに追加しました。", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
+        if (WriteUserPathChecked(updated))
+        {
+            RefreshPathLists();
+            MessageBox.Show("ユーザーPathに追加しました。", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
     }
 
     private void AddSystemPathButton_Click(object sender, RoutedEventArgs e)
@@ -259,8 +367,15 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (_systemEditMode)
+        {
+            _systemEntries.Add(new PathEntry(PathToAdd!) { IsNewlyAdded = true });
+            UpdateDuplicates();
+            return;
+        }
+
         string updated = BuildPathString(_systemEntries) + ";" + PathToAdd;
-        if (WriteSystemPath(updated))
+        if (WriteSystemPathChecked(updated))
         {
             RefreshPathLists();
             MessageBox.Show("システムPathに追加しました。", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -269,34 +384,53 @@ public partial class MainWindow : Window
 
     // --- 削除 ---
 
-    private void DeletePathEntry(PathEntry entry, EnvironmentVariableTarget target)
+    private void DeletePathEntries(IReadOnlyList<PathEntry> entries, EnvironmentVariableTarget target)
     {
-        if (MessageBox.Show($"以下のエントリをPathから削除しますか？\n\n{entry.Path}",
-                "確認", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+        if (entries.Count == 0) return;
+
+        string prompt = entries.Count == 1
+            ? $"以下のエントリをPathから削除しますか？\n\n{entries[0].Path}"
+            : $"選択された {entries.Count} 件のエントリをPathから削除しますか？\n\n"
+                + string.Join("\n", entries.Take(10).Select(en => "・" + en.Path))
+                + (entries.Count > 10 ? $"\n…ほか {entries.Count - 10} 件" : "");
+
+        if (MessageBox.Show(prompt, "確認", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
             return;
+
+        var toRemove = entries.ToHashSet();
 
         if (target == EnvironmentVariableTarget.User)
         {
-            _userEntries.Remove(entry);
-            WriteUserPath(BuildPathString(_userEntries));
-            UpdateDuplicates();
+            if (_userEditMode)
+            {
+                foreach (var en in entries) _userEntries.Remove(en);
+                UpdateDuplicates();
+            }
+            else
+            {
+                string updated = BuildPathString(_userEntries.Where(en => !toRemove.Contains(en)));
+                if (WriteUserPathChecked(updated))
+                    RefreshPathLists();
+            }
         }
         else
         {
             if (_systemEditMode)
             {
-                _systemEntries.Remove(entry);
+                foreach (var en in entries) _systemEntries.Remove(en);
+                UpdateDuplicates();
             }
             else
             {
-                string updated = BuildPathString(_systemEntries.Where(en => en != entry));
-                if (WriteSystemPath(updated))
-                {
+                string updated = BuildPathString(_systemEntries.Where(en => !toRemove.Contains(en)));
+                if (WriteSystemPathChecked(updated))
                     RefreshPathLists();
-                }
             }
         }
     }
+
+    private static List<PathEntry> GetSelectedEntries(ListBox listBox)
+        => listBox.SelectedItems.OfType<PathEntry>().ToList();
 
     // --- コンテキストメニュー ---
 
@@ -304,10 +438,17 @@ public partial class MainWindow : Window
     {
         if (sender is not ListBox listBox) return;
         var item = ItemsControl.ContainerFromElement(listBox, e.OriginalSource as DependencyObject) as ListBoxItem;
-        if (item != null)
-            item.IsSelected = true;
-        else
+        if (item == null)
+        {
             e.Handled = true;
+            return;
+        }
+        // 既に複数選択されている項目を右クリックした場合は選択を保持する
+        if (!item.IsSelected)
+        {
+            listBox.SelectedItems.Clear();
+            item.IsSelected = true;
+        }
     }
 
     private void PathListBox_MouseDoubleClick(object sender, MouseButtonEventArgs e)
@@ -319,9 +460,11 @@ public partial class MainWindow : Window
     private void PathListBox_KeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key != Key.Delete) return;
-        if (sender is not ListBox listBox || listBox.SelectedItem is not PathEntry entry) return;
+        if (sender is not ListBox listBox) return;
+        var entries = GetSelectedEntries(listBox);
+        if (entries.Count == 0) return;
         var target = listBox == UserPathListBox ? EnvironmentVariableTarget.User : EnvironmentVariableTarget.Machine;
-        DeletePathEntry(entry, target);
+        DeletePathEntries(entries, target);
     }
 
     private void UserPathListBoxMenuItem_OpenFolder_Click(object sender, RoutedEventArgs e)
@@ -336,46 +479,88 @@ public partial class MainWindow : Window
 
     private void UserPathListBoxMenuItem_Copy_Click(object sender, RoutedEventArgs e)
     {
-        if (UserPathListBox.SelectedItem is PathEntry entry) Clipboard.SetText(entry.Path);
+        var paths = GetSelectedEntries(UserPathListBox).Select(en => en.Path).ToList();
+        if (paths.Count > 0) Clipboard.SetText(string.Join(Environment.NewLine, paths));
     }
 
     private void SystemPathListBoxMenuItem_Copy_Click(object sender, RoutedEventArgs e)
     {
-        if (SystemPathListBox.SelectedItem is PathEntry entry) Clipboard.SetText(entry.Path);
+        var paths = GetSelectedEntries(SystemPathListBox).Select(en => en.Path).ToList();
+        if (paths.Count > 0) Clipboard.SetText(string.Join(Environment.NewLine, paths));
     }
 
     private void UserPathListBoxMenuItem_Delete_Click(object sender, RoutedEventArgs e)
-    {
-        if (UserPathListBox.SelectedItem is PathEntry entry)
-            DeletePathEntry(entry, EnvironmentVariableTarget.User);
-    }
+        => DeletePathEntries(GetSelectedEntries(UserPathListBox), EnvironmentVariableTarget.User);
 
     private void SystemPathListBoxMenuItem_Delete_Click(object sender, RoutedEventArgs e)
-    {
-        if (SystemPathListBox.SelectedItem is PathEntry entry)
-            DeletePathEntry(entry, EnvironmentVariableTarget.Machine);
-    }
+        => DeletePathEntries(GetSelectedEntries(SystemPathListBox), EnvironmentVariableTarget.Machine);
 
-    // --- 並び替え（ユーザーPath） ---
+    // --- 並び替え（ユーザーPath・編集モード） ---
 
     private void UserMoveUpButton_Click(object sender, RoutedEventArgs e)
     {
-        if (UserPathListBox.SelectedItem is not PathEntry entry) return;
+        if (!_userEditMode || UserPathListBox.SelectedItem is not PathEntry entry) return;
         int idx = _userEntries.IndexOf(entry);
         if (idx <= 0) return;
         _userEntries.Move(idx, idx - 1);
-        WriteUserPath(BuildPathString(_userEntries));
         UserPathListBox.SelectedItem = entry;
     }
 
     private void UserMoveDownButton_Click(object sender, RoutedEventArgs e)
     {
-        if (UserPathListBox.SelectedItem is not PathEntry entry) return;
+        if (!_userEditMode || UserPathListBox.SelectedItem is not PathEntry entry) return;
         int idx = _userEntries.IndexOf(entry);
         if (idx < 0 || idx >= _userEntries.Count - 1) return;
         _userEntries.Move(idx, idx + 1);
-        WriteUserPath(BuildPathString(_userEntries));
         UserPathListBox.SelectedItem = entry;
+    }
+
+    private void UserEditButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_userEditMode)
+        {
+            string updated = BuildPathString(_userEntries);
+            if (WriteUserPathChecked(updated))
+            {
+                ExitUserEditMode();
+                RefreshPathLists();
+                MessageBox.Show("ユーザーPathを更新しました。", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+        else
+        {
+            _userEditSnapshot = [.. _userEntries];
+            _userEditMode = true;
+            UserEditButton.Content = "適用";
+            UserCancelButton.Visibility = Visibility.Visible;
+            UserMoveUpButton.IsEnabled = true;
+            UserMoveDownButton.IsEnabled = true;
+        }
+    }
+
+    private void UserCancelButton_Click(object sender, RoutedEventArgs e)
+    {
+        RestoreUserSnapshot();
+        ExitUserEditMode();
+    }
+
+    private void ExitUserEditMode()
+    {
+        _userEditMode = false;
+        _userEditSnapshot = null;
+        UserEditButton.Content = "編集";
+        UserCancelButton.Visibility = Visibility.Collapsed;
+        UserMoveUpButton.IsEnabled = false;
+        UserMoveDownButton.IsEnabled = false;
+    }
+
+    private void RestoreUserSnapshot()
+    {
+        if (_userEditSnapshot is null) return;
+        _userEntries.Clear();
+        foreach (var e in _userEditSnapshot)
+            _userEntries.Add(e);
+        UpdateDuplicates();
     }
 
     // --- 並び替え（システムPath・編集モード） ---
@@ -384,22 +569,17 @@ public partial class MainWindow : Window
     {
         if (_systemEditMode)
         {
-            // 適用
             string updated = BuildPathString(_systemEntries);
-            if (WriteSystemPath(updated))
+            if (WriteSystemPathChecked(updated))
             {
+                ExitSystemEditMode();
                 RefreshPathLists();
                 MessageBox.Show("システムPathを更新しました。", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
             }
-            else
-            {
-                // 失敗したらスナップショットに戻す
-                RestoreSystemSnapshot();
-            }
+            // 失敗時は編集モードを維持してユーザーに再操作の機会を残す
         }
         else
         {
-            // 編集開始
             _systemEditSnapshot = [.. _systemEntries];
             _systemEditMode = true;
             SystemEditButton.Content = "適用（UAC）";
@@ -412,7 +592,7 @@ public partial class MainWindow : Window
     private void SystemCancelButton_Click(object sender, RoutedEventArgs e)
     {
         RestoreSystemSnapshot();
-        ExitSystemEditMode(apply: false);
+        ExitSystemEditMode();
     }
 
     private void SystemMoveUpButton_Click(object sender, RoutedEventArgs e)
@@ -433,7 +613,7 @@ public partial class MainWindow : Window
         SystemPathListBox.SelectedItem = entry;
     }
 
-    private void ExitSystemEditMode(bool apply)
+    private void ExitSystemEditMode()
     {
         _systemEditMode = false;
         _systemEditSnapshot = null;
@@ -449,6 +629,7 @@ public partial class MainWindow : Window
         _systemEntries.Clear();
         foreach (var e in _systemEditSnapshot)
             _systemEntries.Add(e);
+        UpdateDuplicates();
     }
 
     // --- エクスポート ---
@@ -475,6 +656,144 @@ public partial class MainWindow : Window
 
         File.WriteAllText(dialog.FileName, sb.ToString(), Encoding.UTF8);
         MessageBox.Show($"エクスポートしました:\n{dialog.FileName}", "完了", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    // --- インポート（バックアップ復元） ---
+
+    private void ImportButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_userEditMode || _systemEditMode)
+        {
+            MessageBox.Show("編集モード中はインポートできません。先に適用またはキャンセルしてください。",
+                "情報", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var dialog = new OpenFileDialog
+        {
+            Filter = "テキストファイル (*.txt)|*.txt|すべてのファイル (*.*)|*.*",
+            Title = "PATH バックアップを開く"
+        };
+        if (dialog.ShowDialog() != true) return;
+
+        string content;
+        try { content = File.ReadAllText(dialog.FileName, Encoding.UTF8); }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"ファイルを読み込めませんでした:\n{ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        var (userPaths, systemPaths) = ParseBackup(content);
+        if (userPaths.Count == 0 && systemPaths.Count == 0)
+        {
+            MessageBox.Show("バックアップファイルから Path を読み取れませんでした。", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        var choice = MessageBox.Show(
+            $"バックアップを読み込みました。\nユーザー: {userPaths.Count} 件 / システム: {systemPaths.Count} 件\n\n" +
+            "[はい] 現在のPathを完全に置換\n" +
+            "[いいえ] 既存にないPathのみ追加（マージ）\n" +
+            "[キャンセル] 中止",
+            "復元方法", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+
+        if (choice == MessageBoxResult.Cancel) return;
+        bool replace = choice == MessageBoxResult.Yes;
+
+        // 置換モードでバックアップが片方空のとき、現在のPathを消す前に確認
+        if (replace)
+        {
+            if (userPaths.Count == 0 && _userEntries.Count > 0
+                && MessageBox.Show("バックアップにユーザーPathが含まれていません。\n現在のユーザーPathを全て削除しますか？",
+                    "確認", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+                return;
+            if (systemPaths.Count == 0 && _systemEntries.Count > 0
+                && MessageBox.Show("バックアップにシステムPathが含まれていません。\n現在のシステムPathを全て削除しますか？",
+                    "確認", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+                return;
+        }
+
+        var batch = new List<UndoOp>();
+
+        // ユーザーPath
+        var newUserList = replace
+            ? userPaths
+            : MergePaths(_userEntries.Select(en => en.Path), userPaths);
+        string newUserStr = string.Join(";", newUserList);
+        string currentUserStr = BuildPathString(_userEntries);
+        bool userChanged = !string.Equals(newUserStr, currentUserStr, StringComparison.Ordinal);
+
+        if (userChanged && !WriteUserPathChecked(newUserStr, batch))
+        {
+            RefreshPathLists();
+            return;
+        }
+
+        // システムPath
+        var newSystemList = replace
+            ? systemPaths
+            : MergePaths(_systemEntries.Select(en => en.Path), systemPaths);
+        string newSystemStr = string.Join(";", newSystemList);
+        string currentSystemStr = BuildPathString(_systemEntries);
+        bool systemChanged = !string.Equals(newSystemStr, currentSystemStr, StringComparison.Ordinal);
+
+        if (systemChanged && !WriteSystemPathChecked(newSystemStr, batch))
+        {
+            // ユーザー側だけ書き込まれた状態。確定済みの操作はUndoスタックへまとめてプッシュ
+            PushUndo(batch);
+            RefreshPathLists();
+            return;
+        }
+
+        PushUndo(batch);
+        RefreshPathLists();
+
+        if (!userChanged && !systemChanged)
+            MessageBox.Show("変更はありませんでした。", "情報", MessageBoxButton.OK, MessageBoxImage.Information);
+        else
+            MessageBox.Show("バックアップから復元しました。", "完了", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private static (List<string> User, List<string> System) ParseBackup(string content)
+    {
+        var user = new List<string>();
+        var system = new List<string>();
+        List<string>? current = null;
+        foreach (var rawLine in content.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r').Trim();
+            if (string.IsNullOrEmpty(line)) continue;
+            if (line.StartsWith("## ユーザーPath")) { current = user; continue; }
+            if (line.StartsWith("## システムPath")) { current = system; continue; }
+            if (line.StartsWith("#")) continue;
+            current?.Add(line);
+        }
+        return (user, system);
+    }
+
+    private static List<string> MergePaths(IEnumerable<string> existing, IEnumerable<string> incoming)
+    {
+        var result = existing.ToList();
+        var set = new HashSet<string>(result, StringComparer.OrdinalIgnoreCase);
+        foreach (var p in incoming)
+            if (set.Add(p)) result.Add(p);
+        return result;
+    }
+
+    // --- Undo ---
+
+    private void UndoButton_Click(object sender, RoutedEventArgs e) => Undo();
+
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Z
+            && Keyboard.Modifiers == ModifierKeys.Control
+            && Keyboard.FocusedElement is not TextBoxBase)
+        {
+            Undo();
+            e.Handled = true;
+        }
     }
 
     // --- ヘルパー ---

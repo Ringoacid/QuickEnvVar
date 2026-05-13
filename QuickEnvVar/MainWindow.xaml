@@ -8,6 +8,7 @@
     Title="QuickEnvVar"
     Width="900"
     Height="650"
+    PreviewKeyDown="Window_PreviewKeyDown"
     mc:Ignorable="d">
 
     <Window.Resources>
@@ -121,6 +122,13 @@
                 <Button Click="AddUserPathButton_Click" Content="ユーザーPathに追加" />
                 <Button Click="AddSystemPathButton_Click" Content="システムPathに追加（管理者権限）" />
                 <Button Click="ExportButton_Click" Content="バックアップ..." />
+                <Button Click="ImportButton_Click" Content="復元..." ToolTip="バックアップファイルから Path を復元します" />
+                <Button
+                    x:Name="UndoButton"
+                    Click="UndoButton_Click"
+                    Content="↶ 元に戻す"
+                    IsEnabled="False"
+                    ToolTip="直前の書き込みを取り消します（Ctrl+Z）" />
                 <ToggleButton
                     x:Name="MosaicToggleButton"
                     Margin="2"
@@ -164,12 +172,24 @@
                                 x:Name="UserMoveUpButton"
                                 Click="UserMoveUpButton_Click"
                                 Content="▲"
-                                ToolTip="上へ移動" />
+                                IsEnabled="False"
+                                ToolTip="上へ移動（編集モード中のみ）" />
                             <Button
                                 x:Name="UserMoveDownButton"
                                 Click="UserMoveDownButton_Click"
                                 Content="▼"
-                                ToolTip="下へ移動" />
+                                IsEnabled="False"
+                                ToolTip="下へ移動（編集モード中のみ）" />
+                            <Button
+                                x:Name="UserEditButton"
+                                Click="UserEditButton_Click"
+                                Content="編集"
+                                ToolTip="編集モード開始 / 変更をまとめて適用" />
+                            <Button
+                                x:Name="UserCancelButton"
+                                Click="UserCancelButton_Click"
+                                Content="キャンセル"
+                                Visibility="Collapsed" />
                             <Button Click="RefreshPathListsButton_Click" Content="更新" />
                         </StackPanel>
                     </DockPanel>
@@ -196,7 +216,8 @@
                     HorizontalContentAlignment="Stretch"
                     KeyDown="PathListBox_KeyDown"
                     MouseDoubleClick="PathListBox_MouseDoubleClick"
-                    PreviewMouseRightButtonDown="PathListBox_PreviewMouseRightButtonDown">
+                    PreviewMouseRightButtonDown="PathListBox_PreviewMouseRightButtonDown"
+                    SelectionMode="Extended">
                     <ListBox.ContextMenu>
                         <ContextMenu>
                             <MenuItem Click="UserPathListBoxMenuItem_OpenFolder_Click" Header="フォルダを開く" />
@@ -264,7 +285,8 @@
                     HorizontalContentAlignment="Stretch"
                     KeyDown="PathListBox_KeyDown"
                     MouseDoubleClick="PathListBox_MouseDoubleClick"
-                    PreviewMouseRightButtonDown="PathListBox_PreviewMouseRightButtonDown">
+                    PreviewMouseRightButtonDown="PathListBox_PreviewMouseRightButtonDown"
+                    SelectionMode="Extended">
                     <ListBox.ContextMenu>
                         <ContextMenu>
                             <MenuItem Click="SystemPathListBoxMenuItem_OpenFolder_Click" Header="フォルダを開く" />
