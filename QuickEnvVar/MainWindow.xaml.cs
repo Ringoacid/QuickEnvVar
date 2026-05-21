@@ -210,6 +210,8 @@ public partial class MainWindow : Window
         var ops = _undoStack.Pop();
         UpdateUndoButton();
 
+        var succeededOps = new List<UndoOp>();
+
         // システム側を含む場合はUACが必要。失敗時は再プッシュして整合性を保つ
         foreach (var op in ops)
         {
@@ -218,11 +220,17 @@ public partial class MainWindow : Window
                 : WriteSystemPath(op.OldValue);
             if (!ok)
             {
-                _undoStack.Push(ops);
-                UpdateUndoButton();
+                // 実行に成功した操作を除外した「残りの操作リスト」を再プッシュする
+                var remainingOps = ops.Where(x => !succeededOps.Contains(x)).ToList();
+                if (remainingOps.Count > 0)
+                {
+                    _undoStack.Push(remainingOps);
+                    UpdateUndoButton();
+                }
                 RefreshPathLists();
                 return;
             }
+            succeededOps.Add(op);
         }
 
         RefreshPathLists();
@@ -300,7 +308,9 @@ public partial class MainWindow : Window
 
     private bool ValidateSelectedPath()
     {
-        if (PathToAdd is null || !Directory.Exists(Environment.ExpandEnvironmentVariables(PathToAdd)))
+        if (PathToAdd is null) return false;
+        string trimmed = PathToAdd.Trim();
+        if (string.IsNullOrEmpty(trimmed) || !Directory.Exists(Environment.ExpandEnvironmentVariables(trimmed)))
         {
             MessageBox.Show("有効なパスを選択してください。", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
             return false;
@@ -336,7 +346,9 @@ public partial class MainWindow : Window
     {
         if (!ValidateSelectedPath()) return;
 
-        if (_userEntries.Any(en => en.Path.Equals(PathToAdd, StringComparison.OrdinalIgnoreCase)))
+        string cleanPath = PathToAdd!.Trim();
+
+        if (_userEntries.Any(en => en.Path.Equals(cleanPath, StringComparison.OrdinalIgnoreCase)))
         {
             MessageBox.Show("すでにユーザーPathに含まれています。", "情報", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
@@ -344,12 +356,13 @@ public partial class MainWindow : Window
 
         if (_userEditMode)
         {
-            _userEntries.Add(new PathEntry(PathToAdd!) { IsNewlyAdded = true });
+            _userEntries.Add(new PathEntry(cleanPath) { IsNewlyAdded = true });
             UpdateDuplicates();
             return;
         }
 
-        string updated = BuildPathString(_userEntries) + ";" + PathToAdd;
+        string existing = BuildPathString(_userEntries);
+        string updated = string.IsNullOrEmpty(existing) ? cleanPath : existing + ";" + cleanPath;
         if (WriteUserPathChecked(updated))
         {
             RefreshPathLists();
@@ -361,7 +374,9 @@ public partial class MainWindow : Window
     {
         if (!ValidateSelectedPath()) return;
 
-        if (_systemEntries.Any(en => en.Path.Equals(PathToAdd, StringComparison.OrdinalIgnoreCase)))
+        string cleanPath = PathToAdd!.Trim();
+
+        if (_systemEntries.Any(en => en.Path.Equals(cleanPath, StringComparison.OrdinalIgnoreCase)))
         {
             MessageBox.Show("すでにシステムPathに含まれています。", "情報", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
@@ -369,12 +384,13 @@ public partial class MainWindow : Window
 
         if (_systemEditMode)
         {
-            _systemEntries.Add(new PathEntry(PathToAdd!) { IsNewlyAdded = true });
+            _systemEntries.Add(new PathEntry(cleanPath) { IsNewlyAdded = true });
             UpdateDuplicates();
             return;
         }
 
-        string updated = BuildPathString(_systemEntries) + ";" + PathToAdd;
+        string existing = BuildPathString(_systemEntries);
+        string updated = string.IsNullOrEmpty(existing) ? cleanPath : existing + ";" + cleanPath;
         if (WriteSystemPathChecked(updated))
         {
             RefreshPathLists();
@@ -654,8 +670,15 @@ public partial class MainWindow : Window
         foreach (var entry in _systemEntries)
             sb.AppendLine(entry.Path);
 
-        File.WriteAllText(dialog.FileName, sb.ToString(), Encoding.UTF8);
-        MessageBox.Show($"エクスポートしました:\n{dialog.FileName}", "完了", MessageBoxButton.OK, MessageBoxImage.Information);
+        try
+        {
+            File.WriteAllText(dialog.FileName, sb.ToString(), Encoding.UTF8);
+            MessageBox.Show($"エクスポートしました:\n{dialog.FileName}", "完了", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"ファイルのエクスポートに失敗しました:\n{ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     // --- インポート（バックアップ復元） ---
